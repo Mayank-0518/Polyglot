@@ -1,0 +1,10 @@
+.env
+.venv/
+.tools/
+data/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+*.log
+*.pcap
+*.pcapng

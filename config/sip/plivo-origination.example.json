@@ -1,0 +1,7 @@
+{
+  "name": "call-translator-livekit-india",
+  "uri": "<LIVEKIT_SIP_SUBDOMAIN>.india.sip.livekit.cloud;transport=tcp",
+  "authentication_needed": true,
+  "username": "<INBOUND_SIP_USERNAME>",
+  "password": "<INBOUND_SIP_PASSWORD>"
+}

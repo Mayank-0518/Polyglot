@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Sip username="&lt;INBOUND_SIP_USERNAME&gt;" password="&lt;INBOUND_SIP_PASSWORD&gt;">sip:&lt;SIP_NUMBER&gt;@&lt;LIVEKIT_SIP_SUBDOMAIN&gt;.india.sip.livekit.cloud;transport=tcp</Sip>
+  </Dial>
+</Response>

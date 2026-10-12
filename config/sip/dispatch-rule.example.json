@@ -1,0 +1,13 @@
+{
+  "dispatch_rule": {
+    "name": "call-translator",
+    "trunkIds": ["<LIVEKIT_INBOUND_TRUNK_ID>"],
+    "inboundNumbers": ["+919123260733", "+916392306428"],
+    "rule": {
+      "dispatchRuleIndividual": {"roomPrefix": "call-"}
+    },
+    "roomConfig": {
+      "agents": [{"agentName": "translator"}]
+    }
+  }
+}

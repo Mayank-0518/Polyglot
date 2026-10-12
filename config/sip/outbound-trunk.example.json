@@ -1,0 +1,11 @@
+{
+  "trunk": {
+    "name": "call-translator-twilio-outbound",
+    "address": "<TWILIO_TERMINATION_SIP_DOMAIN>",
+    "numbers": ["<SIP_NUMBER>"],
+    "authUsername": "<OUTBOUND_SIP_USERNAME>",
+    "authPassword": "<OUTBOUND_SIP_PASSWORD>",
+    "transport": "SIP_TRANSPORT_TCP",
+    "destinationCountry": "in"
+  }
+}

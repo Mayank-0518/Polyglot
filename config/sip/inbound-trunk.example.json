@@ -1,0 +1,9 @@
+{
+  "trunk": {
+    "name": "call-translator-twilio-inbound",
+    "numbers": ["<SIP_NUMBER>"],
+    "allowedNumbers": ["+919123260733", "+916392306428"],
+    "authUsername": "<INBOUND_SIP_USERNAME>",
+    "authPassword": "<INBOUND_SIP_PASSWORD>"
+  }
+}

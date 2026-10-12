@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "call-translator"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.9",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "httpx>=0.27",
+  "livekit>=1.0",
+  "livekit-api>=1.0",
+  "livekit-agents>=1.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# live/e2e are opt-in: `pytest -m live` / `pytest -m e2e` (last -m wins)
+addopts = "-m 'not live and not e2e'"
+markers = [
+  "live: hits real AI vendors (needs SARVAM_API_KEY)",
+  "e2e: needs LiveKit + API + agent running (VENDORS=fake, DIAL_MODE=room)",
+]
