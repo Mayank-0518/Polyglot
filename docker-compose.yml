@@ -4,11 +4,6 @@ x-app: &app
   volumes: [".:/app"]
 
 services:
-  livekit:
-    image: livekit/livekit-server:latest
-    command: --dev --bind 0.0.0.0
-    ports: ["7880:7880"]
-
   api:
     <<: *app
     ports: ["8000:8000"]
@@ -16,11 +11,5 @@ services:
   agent:
     <<: *app
     command: python -m app.agent start
-    depends_on: [livekit, api]
+    depends_on: [api]
     stop_grace_period: 75s
-
-  test:
-    <<: *app
-    profiles: ["test"]
-    command: pytest -m e2e -v
-    depends_on: [agent]
