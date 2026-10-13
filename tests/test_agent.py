@@ -56,6 +56,22 @@ async def test_authenticated_lookup(monkeypatch, status):
         assert await agent.lookup("+919123260733") == (route if status == 200 else None)
 
 
+class FakeTTS:
+    """Streaming stand-in for vendors.synthesize: records calls, yields (pcm, rate) chunks."""
+
+    def __init__(self, *chunks, before=None):
+        self.chunks = chunks
+        self.before = before
+        self.calls = []
+
+    async def __call__(self, text, lang):
+        self.calls.append((text, lang))
+        if self.before is not None:
+            await self.before()
+        for chunk in self.chunks:
+            yield chunk
+
+
 @pytest.fixture
 def leg(monkeypatch):
     source = SimpleNamespace(
@@ -68,26 +84,26 @@ def leg(monkeypatch):
     return agent.Leg(SimpleNamespace(), "hi-IN", [])
 
 
-async def test_speaks_only_synthesized_audio_and_records_first_frame_latency(monkeypatch, leg):
+async def test_speaks_streamed_audio_in_20ms_frames_and_records_first_frame_latency(monkeypatch, leg):
     pcm = bytes(24000 * 2 * 3 // 5)
-    synthesize = AsyncMock(return_value=(pcm, 24000))
-    monkeypatch.setattr(agent.vendors, "synthesize", synthesize)
+    tts = FakeTTS((pcm[:1000], 24000), (pcm[1000:], 24000))  # chunk boundary mid-frame
+    monkeypatch.setattr(agent.vendors, "synthesize", tts)
     monkeypatch.setattr(agent.time, "monotonic", lambda: 10)
     await leg.speak("[hi-IN] fake", SimpleNamespace(utterance_end=9.5))
-    synthesize.assert_awaited_once_with("[hi-IN] fake", "hi-IN")
+    assert tts.calls == [("[hi-IN] fake", "hi-IN")]
     frames = [call.args[0] for call in leg.source.capture_frame.await_args_list]
     assert b"".join(frame.data.tobytes() for frame in frames) == pcm
+    assert all(frame.samples_per_channel == 480 for frame in frames)
     assert all(frame.sample_rate == 24000 and frame.num_channels == 1 for frame in frames)
     assert leg.latencies == [500]
     leg.source.wait_for_playout.assert_awaited_once()
 
 
 async def test_interrupt_during_synthesis_discards_pending_audio(monkeypatch, leg):
-    async def synthesize(*args):
+    async def interrupt():
         leg.interrupt()
-        return bytes(960), 24000
 
-    monkeypatch.setattr(agent.vendors, "synthesize", synthesize)
+    monkeypatch.setattr(agent.vendors, "synthesize", FakeTTS((bytes(960), 24000), before=interrupt))
     await leg.speak("translated", SimpleNamespace(utterance_end=0))
     leg.source.capture_frame.assert_not_awaited()
     leg.source.clear_queue.assert_called_once()
@@ -95,7 +111,7 @@ async def test_interrupt_during_synthesis_discards_pending_audio(monkeypatch, le
 
 
 async def test_interrupt_stops_remaining_frames(monkeypatch, leg):
-    monkeypatch.setattr(agent.vendors, "synthesize", AsyncMock(return_value=(bytes(960 * 10), 24000)))
+    monkeypatch.setattr(agent.vendors, "synthesize", FakeTTS((bytes(960 * 10), 24000)))
     leg.source.capture_frame.side_effect = lambda frame: leg.interrupt()
     await leg.speak("translated", SimpleNamespace(utterance_end=0))
     assert leg.source.capture_frame.await_count == 1
@@ -103,12 +119,33 @@ async def test_interrupt_stops_remaining_frames(monkeypatch, leg):
     leg.source.wait_for_playout.assert_not_awaited()
 
 
-@pytest.mark.parametrize("pcm,rate", [(b"", 24000), (b"a", 24000), (bytes(960), 16000)])
-async def test_invalid_tts_audio_fails_without_publication(monkeypatch, leg, pcm, rate):
-    monkeypatch.setattr(agent.vendors, "synthesize", AsyncMock(return_value=(pcm, rate)))
+@pytest.mark.parametrize("chunks", [
+    [(b"", 24000)], [(b"a", 24000)], [(bytes(960), 16000)], [],
+])
+async def test_invalid_tts_audio_fails_without_publication(monkeypatch, leg, chunks):
+    monkeypatch.setattr(agent.vendors, "synthesize", FakeTTS(*chunks))
     with pytest.raises(ValueError):
         await leg.speak("translated", SimpleNamespace(utterance_end=0))
     leg.source.capture_frame.assert_not_awaited()
+
+
+async def test_mid_stream_stall_keeps_played_audio_and_drops_the_rest(monkeypatch, leg, caplog):
+    monkeypatch.setattr(agent, "VENDOR_TIMEOUT", 0.01)
+    closed = asyncio.Event()
+
+    async def synthesize(text, lang):
+        try:
+            yield bytes(960 * 2), 24000
+            await asyncio.Future()
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(agent.vendors, "synthesize", synthesize)
+    await leg.speak("translated", SimpleNamespace(utterance_end=None))
+    assert leg.source.capture_frame.await_count == 2
+    leg.source.wait_for_playout.assert_not_awaited()
+    assert closed.is_set()
+    assert "vendor_sentence_truncated" in caplog.text
 
 
 async def test_stt_runs_while_translation_consumer_is_idle(monkeypatch, leg):
@@ -285,6 +322,7 @@ async def test_invalid_dial_mode_is_rejected(monkeypatch, context):
 def sip_config(monkeypatch):
     values = {
         "DIAL_MODE": "sip", "VENDORS": "sarvam", "SARVAM_API_KEY": "test-vendor-key",
+        "GNANI_API_KEY": "test-gnani-key",
         "API_KEY": "test-api-key", "API_URL": "http://routing:8000",
         "LIVEKIT_URL": "wss://test.livekit.cloud", "LIVEKIT_API_KEY": "test-cloud-key",
         "LIVEKIT_API_SECRET": "test-cloud-secret-with-at-least-32-bytes",
@@ -301,7 +339,7 @@ def test_valid_sip_config(sip_config):
 
 
 @pytest.mark.parametrize("key,value", [
-    ("API_KEY", ""), ("API_URL", ""), ("SARVAM_API_KEY", " "),
+    ("API_KEY", ""), ("API_URL", ""), ("SARVAM_API_KEY", " "), ("GNANI_API_KEY", " "),
     ("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", ""), ("LIVEKIT_API_KEY", ""),
     ("LIVEKIT_API_SECRET", ""), ("LIVEKIT_API_KEY", "devkey"),
     ("LIVEKIT_API_SECRET", "secret"), ("SIP_NUMBER", ""), ("SIP_NUMBER", "8000000000"),

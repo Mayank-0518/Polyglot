@@ -1,7 +1,6 @@
 import array
 import asyncio
 import base64
-import io
 import json
 import math
 import os
@@ -75,12 +74,20 @@ def _pcm_wav(source):
         return pcm, audio.getframerate()
 
 
+_TTS_VOICES = {
+    "en-IN": "Kaveri", "hi-IN": "Nalini", "ta-IN": "Asmita", "te-IN": "Suhana",
+    "kn-IN": "Saanvi", "ml-IN": "Reshma", "mr-IN": "Zahira", "bn-IN": "Kirra",
+    "gu-IN": "Falak", "pa-IN": "Mehuli",
+}
+
+
 async def synthesize(text, lang):
+    """Yield (pcm_chunk, rate) pairs of mono PCM16 audio at 24000 Hz, streamed as it's synthesized."""
     mode = _mode(lang)
     if not text.strip():
         raise ValueError("Speech text must not be blank")
+    rate = 24000
     if mode == "fake":
-        rate = 24000
         hz = 440 if text.startswith("[") else 550
         samples = array.array("h", (
             int(8000 * math.sin(2 * math.pi * hz * i / rate))
@@ -88,24 +95,51 @@ async def synthesize(text, lang):
         ))
         if sys.byteorder != "little":
             samples.byteswap()
-        return samples.tobytes(), rate
+        pcm = samples.tobytes()
+        chunk_bytes = rate // 50 * 2  # 20ms chunks, matching real streaming granularity
+        for offset in range(0, len(pcm), chunk_bytes):
+            yield pcm[offset:offset + chunk_bytes], rate
+        return
+
+    # VENDORS=sarvam also selects Gnani for TTS; translate() still uses Sarvam.
     if len(text) > 2500:
-        raise ValueError("Bulbul speech input must not exceed 2500 characters")
-    result = await _post("text-to-speech", json={
-        "text": text, "language_code": lang, "model": "bulbul:v3", "speaker": "shubh",
-        "speech_sample_rate": 24000, "output_audio_codec": "wav",
-    })
-    audios = result.get("audios")
-    if not isinstance(audios, list) or not audios:
-        raise ValueError("Sarvam returned no audio")
-    chunks, rate = [], None
-    for encoded in audios:
-        pcm, chunk_rate = _pcm_wav(io.BytesIO(base64.b64decode(encoded, validate=True)))
-        if rate is not None and rate != chunk_rate:
-            raise ValueError("Sarvam audio chunks have different sample rates")
-        chunks.append(pcm)
-        rate = chunk_rate
-    return b"".join(chunks), rate
+        raise ValueError("Gnani speech input must not exceed 2500 characters")
+    voice = _TTS_VOICES.get(lang)
+    if voice is None:
+        raise ValueError(f"Gnani TTS does not support {lang}")
+    key = os.getenv("GNANI_API_KEY", "")
+    if not key.strip():
+        raise ValueError("GNANI_API_KEY is required for Gnani TTS")
+    headers = {"X-API-Key-ID": key}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.ws_connect("wss://api.vachana.ai/api/v1/tts") as ws:
+            await ws.send_json({
+                "text": text, "voice": voice, "model": "timbre-v2.5", "language": lang,
+                "audio_config": {
+                    "sample_rate": rate, "num_channels": 1, "sample_width": 2,
+                    "encoding": "linear_pcm", "container": "raw",
+                },
+            })
+            while True:
+                message = await ws.receive()
+                if message.type != aiohttp.WSMsgType.TEXT:
+                    raise RuntimeError("Gnani TTS socket closed unexpectedly")
+                event = json.loads(message.data)
+                if not isinstance(event, dict):
+                    raise ValueError("Invalid Gnani TTS event")
+                kind = event.get("type")
+                if kind == "error":
+                    raise RuntimeError(f"Gnani TTS reported an error: {event.get('message')}")
+                data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                if kind in {"audio", "complete"}:
+                    encoded = data.get("audio")
+                    if encoded:
+                        pcm = base64.b64decode(encoded, validate=True)
+                        if len(pcm) % 2:
+                            raise ValueError("Gnani returned malformed PCM16 audio")
+                        yield pcm, rate
+                    if data.get("is_final"):
+                        return
 
 
 async def transcribe_file(path, lang):
@@ -169,58 +203,57 @@ async def transcribe_stream(chunks, lang, sample_rate=16000, on_speech_start=Non
                         yield "fake"
         return
 
-    # Realtime STT uses or-IN; REST translation, STT and TTS use od-IN.
-    params = {
-        "model": "saaras:v4", "language_code": "or-IN" if lang == "od-IN" else lang,
-        "mode": "transcribe", "stream_type": "fast", "encoding": "linear16",
-        "sample_rate": str(sample_rate), "endpointing": "vad",
-        "silence_duration_ms": "500", "min_speech_duration_ms": "300",
-    }
+    # VENDORS=sarvam also selects Gnani for live STT; translate()/synthesize() still use Sarvam.
+    key = os.getenv("GNANI_API_KEY", "")
+    if not key.strip():
+        raise ValueError("GNANI_API_KEY is required for Gnani STT")
+    FRAME_BYTES = 1024  # Gnani requires exactly 1024-byte PCM16 frames (512 samples).
+    input_ended = asyncio.Event()
+    buffer = bytearray()
+
+    async def send_audio(ws):
+        try:
+            async for pcm in chunks:
+                _samples(pcm)  # validates whole PCM16 samples
+                buffer.extend(pcm)
+                while len(buffer) >= FRAME_BYTES:
+                    await ws.send_bytes(bytes(buffer[:FRAME_BYTES]))
+                    del buffer[:FRAME_BYTES]
+            if buffer:
+                await ws.send_bytes(bytes(buffer) + bytes(FRAME_BYTES - len(buffer)))
+            input_ended.set()
+        finally:
+            await ws.close()
+
+    headers = {"x-api-key-id": key, "lang_code": lang, "x-sample-rate": str(sample_rate)}
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
-    async with aiohttp.ClientSession(headers=_headers(), timeout=timeout) as session:
-        async with session.ws_connect(
-            "wss://api.sarvam.ai/speech-to-text-realtime/ws", params=params, heartbeat=20,
-        ) as socket:
-            input_ended = asyncio.Event()
-
-            async def send_audio():
-                try:
-                    async for pcm in chunks:
-                        _samples(pcm)
-                        if pcm:
-                            await socket.send_json({"event": "audio_input", "audio": base64.b64encode(pcm).decode("ascii")})
-                    input_ended.set()
-                    await socket.send_json({"event": "end"})
-                    await asyncio.sleep(10)
-                    raise TimeoutError("Sarvam STT did not finish after end of input")
-                except Exception:
-                    await socket.close()
-                    raise
-
-            sender = asyncio.create_task(send_audio())
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with session.ws_connect("wss://api.vachana.ai/stt/v3/stream") as ws:
+            sender = asyncio.create_task(send_audio(ws))
             try:
                 while True:
-                    message = await socket.receive()
+                    message = await ws.receive()
                     if message.type != aiohttp.WSMsgType.TEXT:
-                        raise RuntimeError("Sarvam STT socket closed before session.end")
+                        if input_ended.is_set():
+                            return
+                        raise RuntimeError("Gnani STT socket closed before audio input finished")
                     event = json.loads(message.data)
                     if not isinstance(event, dict):
-                        raise ValueError("Invalid Sarvam STT event")
-                    kind = event.get("event")
+                        raise ValueError("Invalid Gnani STT event")
+                    kind = event.get("type")
                     if kind == "error":
-                        raise RuntimeError("Sarvam STT reported an error")
-                    if kind == "session.end":
-                        if not input_ended.is_set():
-                            raise RuntimeError("Sarvam STT session ended before audio input finished")
-                        return
-                    if kind == "vad.speech_start" and on_speech_start is not None:
-                        on_speech_start()
-                    elif kind == "vad.speech_end" and on_speech_end is not None:
-                        on_speech_end()
-                    elif kind == "transcript.final":
+                        raise RuntimeError(f"Gnani STT reported an error: {event.get('message')}")
+                    if kind == "speech_start":
+                        # Undocumented but confirmed live: fires once per utterance.
+                        if on_speech_start is not None:
+                            on_speech_start()
+                    elif kind == "transcript":
+                        # No separate end-of-speech event is sent; the final transcript doubles as one.
+                        if on_speech_end is not None:
+                            on_speech_end()
                         text = event.get("text")
                         if not isinstance(text, str):
-                            raise ValueError("Sarvam returned an invalid final transcript")
+                            raise ValueError("Gnani returned an invalid transcript")
                         if text.strip():
                             yield text
             finally:

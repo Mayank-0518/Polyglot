@@ -39,6 +39,13 @@ PROMPTS = {
         "failed": "କଲ୍ ସଂଯୋଗ ହୋଇପାରିଲା ନାହିଁ। ଦୟାକରି ପରେ କଲ୍ କରନ୍ତୁ।",
         "wait": "ଦୟାକରି ଅପେକ୍ଷା କରନ୍ତୁ। ଅନୁବାଦ ପାଇଁ ସମୟ ଲାଗୁଛି।",
     },
+    "bn-IN": {
+        "connected": "কল সংযুক্ত হয়েছে। আপনি শুধু অনুবাদ শুনতে পাবেন।",
+        "busy": "অন্য ফোনটি ব্যস্ত আছে। অনুগ্রহ করে পরে কল করুন।",
+        "unanswered": "অন্য ফোন থেকে কোনো উত্তর পাওয়া যায়নি। অনুগ্রহ করে পরে কল করুন।",
+        "failed": "কল সংযুক্ত করা যায়নি। অনুগ্রহ করে পরে কল করুন।",
+        "wait": "অনুগ্রহ করে অপেক্ষা করুন। অনুবাদে সময় লাগছে।",
+    },
 }
 
 
@@ -49,7 +56,7 @@ def validate_config():
     if mode == "room":
         return
     for key in ("API_KEY", "API_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
-                "LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "SARVAM_API_KEY"):
+                "LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "SARVAM_API_KEY", "GNANI_API_KEY"):
         if not os.getenv(key, "").strip():
             raise ValueError(f"{key} is required for SIP calls")
     url = urlsplit(os.getenv("LIVEKIT_URL", ""))
@@ -87,6 +94,14 @@ async def lookup(caller):
             return None
         response.raise_for_status()
         return response.json()
+
+
+async def first_chunk(stream):
+    # Awaiting the first chunk lets VENDOR_TIMEOUT bound time-to-first-audio.
+    try:
+        return await anext(stream), stream
+    except StopAsyncIteration:
+        raise ValueError("TTS returned no audio") from None
 
 
 class Leg:
@@ -161,9 +176,9 @@ class Leg:
         generation = self.generation
         try:
             async with asyncio.timeout(VENDOR_TIMEOUT):
-                pcm, rate = await vendors.synthesize(PROMPTS[self.language][kind], self.language)
+                first, stream = await first_chunk(vendors.synthesize(PROMPTS[self.language][kind], self.language))
             async with asyncio.timeout(5):
-                await self.play(pcm, rate, None, generation)
+                await self.play(first, stream, None, generation)
         except Exception as exc:
             with suppress(Exception):
                 if not self.closed and generation == self.generation:
@@ -196,25 +211,52 @@ class Leg:
     async def speak(self, text, speaker):
         generation = self.generation
         try:
-            pcm, rate = await self.vendor_call(partial(vendors.synthesize, text, self.language), generation)
+            # A fresh stream per attempt, so vendor_call's retry restarts synthesis.
+            first, stream = await self.vendor_call(
+                lambda: first_chunk(vendors.synthesize(text, self.language)), generation,
+            )
         except (TimeoutError, InterruptedError):
             return
-        await self.play(pcm, rate, speaker, generation)
+        try:
+            await self.play(first, stream, speaker, generation)
+        except TimeoutError:
+            # Audio already played can't be retried without repeating it; drop the rest.
+            logger.warning("vendor_sentence_truncated error=TimeoutError")
 
-    async def play(self, pcm, rate, speaker, generation):
-        if rate != self.source.sample_rate or not pcm or len(pcm) % 2:
-            raise ValueError("TTS must return nonempty mono PCM16 at 24000 Hz")
+    async def play(self, first, stream, speaker, generation):
+        rate = self.source.sample_rate
         frame_bytes = rate // 50 * 2
-        for offset in range(0, len(pcm), frame_bytes):
-            if self.closed or generation != self.generation:
-                return
-            frame = pcm[offset:offset + frame_bytes]
-            await self.source.capture_frame(rtc.AudioFrame(frame, rate, 1, len(frame) // 2))
-            if self.closed or generation != self.generation:
-                self.source.clear_queue()
-                return
-            if offset == 0 and speaker is not None and speaker.utterance_end is not None:
-                self.latencies.append((time.monotonic() - speaker.utterance_end) * 1000)
+
+        async def frames():
+            buffer = bytearray()
+            item = first
+            while item is not None:
+                pcm, chunk_rate = item
+                if chunk_rate != rate or not pcm or len(pcm) % 2:
+                    raise ValueError("TTS must return nonempty mono PCM16 at 24000 Hz")
+                buffer.extend(pcm)
+                while len(buffer) >= frame_bytes:
+                    yield bytes(buffer[:frame_bytes])
+                    del buffer[:frame_bytes]
+                async with asyncio.timeout(VENDOR_TIMEOUT):
+                    item = await anext(stream, None)
+            if buffer:
+                yield bytes(buffer)
+
+        measured = False
+        try:
+            async for frame in frames():
+                if self.closed or generation != self.generation:
+                    return
+                await self.source.capture_frame(rtc.AudioFrame(frame, rate, 1, len(frame) // 2))
+                if self.closed or generation != self.generation:
+                    self.source.clear_queue()
+                    return
+                if not measured and speaker is not None and speaker.utterance_end is not None:
+                    self.latencies.append((time.monotonic() - speaker.utterance_end) * 1000)
+                measured = True
+        finally:
+            await stream.aclose()
         await self.source.wait_for_playout()
 
     async def close(self):

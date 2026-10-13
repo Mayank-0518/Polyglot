@@ -11,7 +11,7 @@ from livekit import api
 
 from app import agent
 from app.pipeline import run_direction
-from test_agent import context, leg, sip_call, sip_config
+from test_agent import FakeTTS, context, leg, sip_call, sip_config
 
 
 async def never(*args, **kwargs):
@@ -29,12 +29,12 @@ def sip_error(code):
 @pytest.mark.parametrize("kind", ["connected", "busy", "unanswered", "failed", "wait"])
 async def test_announcements_use_phone_language_without_counting_utterances(monkeypatch, leg, language, kind):
     leg.language = language
-    synthesize = AsyncMock(return_value=(bytes(960), 24000))
-    monkeypatch.setattr(agent.vendors, "synthesize", synthesize)
+    tts = FakeTTS((bytes(960), 24000))
+    monkeypatch.setattr(agent.vendors, "synthesize", tts)
     await leg.announce(kind)
-    synthesize.assert_awaited_once_with(agent.PROMPTS[language][kind], language)
+    assert tts.calls == [(agent.PROMPTS[language][kind], language)]
     script = (0x0900, 0x097F) if language == "hi-IN" else (0x0B00, 0x0B7F)
-    assert any(script[0] <= ord(char) <= script[1] for char in synthesize.call_args.args[0])
+    assert any(script[0] <= ord(char) <= script[1] for char in tts.calls[0][0])
     leg.source.capture_frame.assert_awaited_once()
     assert leg.latencies == []
 
@@ -91,13 +91,13 @@ async def test_translation_timeout_prompts_listener_once_then_retries(monkeypatc
     source_language = "od-IN" if language == "hi-IN" else "hi-IN"
     speaker = SimpleNamespace(language=source_language)
     translate = AsyncMock(side_effect=[httpx.ReadTimeout("private request URL"), "translated"])
-    synthesize = AsyncMock(return_value=(bytes(960), 24000))
+    tts = FakeTTS((bytes(960), 24000))
     monkeypatch.setattr(agent.vendors, "translate", translate)
-    monkeypatch.setattr(agent.vendors, "synthesize", synthesize)
+    monkeypatch.setattr(agent.vendors, "synthesize", tts)
     assert await agent.Leg.translate_to(speaker, "source", leg) == "translated"
     assert translate.await_count == 2
     translate.assert_awaited_with("source", src=source_language, tgt=language)
-    synthesize.assert_awaited_once_with(agent.PROMPTS[language]["wait"], language)
+    assert tts.calls == [(agent.PROMPTS[language]["wait"], language)]
     assert leg.latencies == []
 
 
@@ -161,7 +161,7 @@ async def test_synthesis_twice_timing_out_skips_audio_then_next_sentence_plays(m
         attempts.append(text)
         if text == "slow":
             await asyncio.Future()
-        return bytes(960), 24000
+        yield bytes(960), 24000
 
     monkeypatch.setattr(agent.vendors, "synthesize", synthesize)
     speaker = SimpleNamespace(utterance_end=None)
@@ -175,11 +175,17 @@ async def test_synthesis_twice_timing_out_skips_audio_then_next_sentence_plays(m
 
 async def test_failed_wait_prompt_does_not_recurse_or_prevent_retry(monkeypatch, leg):
     monkeypatch.setattr(agent, "VENDOR_TIMEOUT", 0.01)
-    synthesize = AsyncMock(side_effect=never)
+    calls = []
+
+    async def synthesize(*args):
+        calls.append(args)
+        await asyncio.Future()
+        yield
+
     monkeypatch.setattr(agent.vendors, "synthesize", synthesize)
     operation = AsyncMock(side_effect=[TimeoutError(), "retried"])
     assert await asyncio.wait_for(leg.vendor_call(operation, leg.generation), 1) == "retried"
-    synthesize.assert_awaited_once()
+    assert len(calls) == 1
     assert operation.await_count == 2
 
 
@@ -193,7 +199,7 @@ async def test_non_timeout_vendor_error_is_not_retried(leg):
 
 
 async def test_announcement_playback_failure_clears_queued_prompt(monkeypatch, leg):
-    monkeypatch.setattr(agent.vendors, "synthesize", AsyncMock(return_value=(bytes(960), 24000)))
+    monkeypatch.setattr(agent.vendors, "synthesize", FakeTTS((bytes(960), 24000)))
     leg.play = AsyncMock(side_effect=TimeoutError("playout stuck"))
     await leg.announce("wait")
     leg.source.clear_queue.assert_called_once()

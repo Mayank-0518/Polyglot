@@ -95,15 +95,19 @@ async def test_translate_connection_reuse_diagnostic(text, src, tgt, block, tran
     assert all(elapsed < 1.5 for elapsed in elapsed_samples), elapsed_samples
 
 
-@pytest.mark.parametrize("text,lang", [("मैं गेट के पास हूँ", "hi-IN"), ("ମୁଁ ଗେଟ୍ ପାଖରେ ଅଛି", "od-IN")])
+@pytest.mark.parametrize("text,lang", [("मैं गेट के पास हूँ", "hi-IN"), ("আমি গেটের কাছে আছি", "bn-IN")])
+@pytest.mark.skipif(not os.getenv("GNANI_API_KEY"), reason="needs GNANI_API_KEY")
 async def test_synthesize(text, lang):
     from app import vendors
-    pcm, rate = await vendors.synthesize(text, lang)
-    assert len(pcm) / 2 / rate > 0.5  # at least half a second of 16-bit audio
+    streamed = [item async for item in vendors.synthesize(text, lang)]
+    assert len(streamed) > 1  # actually streamed, not one blob
+    assert {rate for _, rate in streamed} == {24000}
+    assert sum(len(pcm) for pcm, _ in streamed) / 2 / 24000 > 0.5  # at least half a second of audio
 
 
-@pytest.mark.parametrize("lang,block", [("od-IN", ODIA), ("hi-IN", DEVANAGARI)])
+@pytest.mark.parametrize("lang,block", [("hi-IN", DEVANAGARI)])
 @pytest.mark.skipif(not FIXTURES, reason="needs WAV fixtures for streaming STT")
+@pytest.mark.skipif(not os.getenv("GNANI_API_KEY"), reason="needs GNANI_API_KEY")
 async def test_transcribe_stream(lang, block):
     from app import vendors
     path = Path(__file__).parent / "fixtures" / f"{lang}_01.wav"

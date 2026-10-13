@@ -70,9 +70,11 @@ async def test_fake_translation_without_network(src, tgt, no_network):
 
 @pytest.mark.parametrize("text,hz", [("[hi-IN] fake", 440), ("Please wait", 550)])
 async def test_fake_tts_duration_rate_and_frequency(text, hz, no_network):
-    data, rate = await vendors.synthesize(text, "od-IN")
-    assert rate == 24000
-    assert len(data) == int(0.6 * rate) * 2
+    streamed = [item async for item in vendors.synthesize(text, "od-IN")]
+    assert len(streamed) > 1
+    assert {rate for _, rate in streamed} == {24000}
+    data = b"".join(chunk for chunk, _ in streamed)
+    assert len(data) == int(0.6 * 24000) * 2
     samples = [sample[0] for sample in struct.iter_unpack("<h", data)]
     crossings = sum((a < 0) != (b < 0) for a, b in zip(samples, samples[1:]))
     assert abs(crossings / 2 / 0.6 - hz) < 2
@@ -153,23 +155,6 @@ async def test_sarvam_translation_request_and_response(mock_http, src, tgt, outp
     assert await vendors.translate("gate 3", src, tgt) == output
 
 
-async def test_sarvam_tts_decodes_each_wav_before_concatenating(mock_http):
-    first, second = pcm(400, 24000), pcm(300, 24000, 3000)
-
-    def handler(request):
-        assert request.url.path == "/text-to-speech"
-        assert json.loads(request.content) == {
-            "text": "ମୁଁ ଏଠାରେ ଅଛି", "language_code": "od-IN", "model": "bulbul:v3",
-            "speaker": "shubh", "speech_sample_rate": 24000, "output_audio_codec": "wav",
-        }
-        return httpx.Response(200, json={"audios": [
-            base64.b64encode(wav_bytes(data, rate=24000)).decode() for data in (first, second)
-        ]})
-
-    mock_http(handler)
-    assert await vendors.synthesize("ମୁଁ ଏଠାରେ ଅଛି", "od-IN") == (first + second, 24000)
-
-
 async def test_sarvam_file_sends_wav_and_native_language(mock_http, tmp_path):
     data = wav_bytes(pcm(800, 8000), rate=8000)
     path = tmp_path / "odia.wav"
@@ -234,34 +219,28 @@ async def test_failed_vendor_translation_never_speaks_original(mock_http):
     assert len(errors) == 1 and isinstance(errors[0], httpx.HTTPStatusError)
 
 
-@pytest.mark.parametrize("audios", [[], ["not base64!"], [base64.b64encode(b"not a WAV").decode()], [
-    base64.b64encode(wav_bytes(pcm(100), rate=16000)).decode(),
-    base64.b64encode(wav_bytes(pcm(100, 8000), rate=8000)).decode(),
-], [base64.b64encode(wav_bytes(pcm(100), channels=2)).decode()]])
-async def test_invalid_tts_audio_is_rejected(mock_http, audios):
-    mock_http(lambda request: httpx.Response(200, json={"audios": audios}))
-    with pytest.raises((ValueError, wave.Error)):
-        await vendors.synthesize("hello", "hi-IN")
-
-
 class Socket:
-    def __init__(self, events, emit_on="end"):
-        self.events = events
-        self.emit_on = emit_on
+    """Gnani pushes events independently of client sends; close() always follows."""
+
+    def __init__(self, events):
         self.received = asyncio.Queue()
+        for event in events:
+            self.received.put_nowait(SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(event)))
         self.sent = []
         self.closed = False
 
+    async def send_bytes(self, data):
+        self.sent.append(data)
+
     async def send_json(self, data):
         self.sent.append(data)
-        if data["event"] == self.emit_on:
-            for event in self.events:
-                await self.received.put(SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(event)))
 
     async def receive(self):
         return await self.received.get()
 
     async def close(self):
+        if self.closed:
+            return
         self.closed = True
         await self.received.put(SimpleNamespace(type=aiohttp.WSMsgType.CLOSED))
 
@@ -269,13 +248,13 @@ class Socket:
 @pytest.fixture
 def mock_socket(monkeypatch):
     monkeypatch.setenv("VENDORS", "sarvam")
-    monkeypatch.setenv("SARVAM_API_KEY", "test-sarvam-key")
+    monkeypatch.setenv("GNANI_API_KEY", "test-gnani-key")
     connections = []
 
     def install(socket):
         @asynccontextmanager
         async def connect(url, **kwargs):
-            connections.append((url, kwargs))
+            connections.append(url)
             try:
                 yield socket
             finally:
@@ -283,7 +262,8 @@ def mock_socket(monkeypatch):
 
         @asynccontextmanager
         async def session(**kwargs):
-            assert kwargs["headers"]["api-subscription-key"] == "test-sarvam-key"
+            socket.headers = {key.lower(): value for key, value in kwargs["headers"].items()}
+            assert socket.headers["x-api-key-id"] == "test-gnani-key"
             yield SimpleNamespace(ws_connect=connect)
 
         monkeypatch.setattr(vendors.aiohttp, "ClientSession", session)
@@ -292,36 +272,79 @@ def mock_socket(monkeypatch):
     return install
 
 
-@pytest.mark.parametrize("lang,code,rate", [("od-IN", "or-IN", 8000), ("hi-IN", "hi-IN", 16000)])
-async def test_realtime_stt_yields_only_final_transcripts_and_maps_odia(mock_socket, lang, code, rate):
+def tts_audio(index, data, final=False):
+    kind = "complete" if final else "audio"
+    return {"type": kind, "data": {"chunk_index": index, "audio": base64.b64encode(data).decode(), "is_final": final}}
+
+
+@pytest.mark.parametrize("lang,voice", [("bn-IN", "Kirra"), ("hi-IN", "Nalini")])
+async def test_gnani_tts_streams_decoded_chunks_in_order(mock_socket, lang, voice):
+    first, second = pcm(40, 24000), pcm(30, 24000, 3000)
+    socket = Socket([
+        {"type": "start", "message": "Streaming started"},
+        tts_audio(1, first), tts_audio(2, second), tts_audio(3, b"", final=True),
+    ])
+    connections = mock_socket(socket)
+    assert [item async for item in vendors.synthesize("text", lang)] == [(first, 24000), (second, 24000)]
+    assert connections == ["wss://api.vachana.ai/api/v1/tts"]
+    request = socket.sent[0]
+    assert (request["text"], request["voice"], request["language"], request["model"]) == ("text", voice, lang, "timbre-v2.5")
+    assert request["audio_config"]["sample_rate"] == 24000
+    assert request["audio_config"]["container"] == "raw"
+    assert socket.closed
+
+
+@pytest.mark.parametrize("events", [
+    [{"type": "error", "message": "Invalid text or audio configuration."}],
+    [tts_audio(1, b"x")],  # odd byte count is not whole PCM16
+    [{"type": "audio", "data": {"chunk_index": 1, "audio": "not base64!", "is_final": False}}],
+    [[]],
+    [tts_audio(1, pcm(20, 24000))],  # socket closes before the final chunk
+])
+async def test_gnani_tts_invalid_stream_is_an_error(mock_socket, events):
+    socket = Socket(events)
+    await socket.close()  # the server hangs up after the scripted events
+    mock_socket(socket)
+    with pytest.raises((RuntimeError, ValueError)):
+        async for _ in vendors.synthesize("text", "hi-IN"):
+            pass
+
+
+async def test_gnani_tts_rejects_unsupported_language_before_network(monkeypatch, no_network):
+    monkeypatch.setenv("VENDORS", "sarvam")
+    monkeypatch.setenv("GNANI_API_KEY", "test-gnani-key")
+    with pytest.raises(ValueError, match="does not support od-IN"):
+        await anext(vendors.synthesize("text", "od-IN"))
+
+
+@pytest.mark.parametrize("lang,rate", [("bn-IN", 8000), ("hi-IN", 16000)])
+async def test_realtime_stt_yields_transcripts_and_fires_speech_events(mock_socket, lang, rate):
     events = []
     socket = Socket([
-        {"event": "session.begin"}, {"event": "vad.speech_start"},
-        {"event": "transcript.partial", "text": "unfinished"},
-        {"event": "vad.speech_end"}, {"event": "transcript.final", "text": "final"},
-        {"event": "transcript.final", "text": " "}, {"event": "session.end"},
+        {"type": "connected", "config": {"sample_rate": rate, "chunk_size": 512}},
+        {"type": "speech_start", "utterance_id": "u1"},
+        {"type": "transcript", "text": "final", "is_final": True},
     ])
     connections = mock_socket(socket)
     audio = pcm(20, rate)
     results = [text async for text in vendors.transcribe_stream(
-        chunks(audio), lang, rate, lambda: events.append("start"), lambda: events.append("end"),
+        chunks(audio), lang, rate,
+        lambda: events.append("start"), lambda: events.append("end"),
     )]
     assert results == ["final"]
     assert events == ["start", "end"]
-    url, options = connections[0]
-    assert url == "wss://api.sarvam.ai/speech-to-text-realtime/ws"
-    assert options["params"]["language_code"] == code
-    assert options["params"]["sample_rate"] == str(rate)
-    assert options["params"]["mode"] == "transcribe"
-    assert options["params"]["encoding"] == "linear16"
-    assert options["params"]["model"] == "saaras:v4"
-    sent_audio = b"".join(base64.b64decode(event["audio"]) for event in socket.sent if event["event"] == "audio_input")
-    assert sent_audio == audio
-    assert socket.sent[-1] == {"event": "end"}
+    assert connections[0] == "wss://api.vachana.ai/stt/v3/stream"
+    assert socket.headers["lang_code"] == lang
+    assert socket.headers["x-sample-rate"] == str(rate)
+    sent_audio = b"".join(socket.sent)
+    assert sent_audio.startswith(audio)
+    assert len(sent_audio) % 1024 == 0
     assert socket.closed
 
 
-@pytest.mark.parametrize("event", [{"event": "error", "message": "vendor failure"}, {"event": "transcript.final", "text": None}])
+@pytest.mark.parametrize("event", [
+    {"type": "error", "message": "vendor failure"}, {"type": "transcript", "text": None},
+])
 async def test_realtime_errors_are_not_transcripts(mock_socket, event):
     socket = Socket([event])
     mock_socket(socket)
@@ -331,12 +354,14 @@ async def test_realtime_errors_are_not_transcripts(mock_socket, event):
 
 
 async def test_realtime_consumer_close_cancels_audio_producer(mock_socket):
+    started = asyncio.Event()
     stopped = asyncio.Event()
-    socket = Socket([{"event": "transcript.final", "text": "final"}], emit_on="audio_input")
+    socket = Socket([{"type": "transcript", "text": "final"}])
     mock_socket(socket)
 
     async def microphone():
         try:
+            started.set()
             yield pcm(20)
             await asyncio.Future()
         finally:
@@ -344,6 +369,7 @@ async def test_realtime_consumer_close_cancels_audio_producer(mock_socket):
 
     stream = vendors.transcribe_stream(microphone(), "hi-IN")
     assert await asyncio.wait_for(anext(stream), 1) == "final"
+    await started.wait()  # ensure the sender task actually entered the generator before cancelling it
     await stream.aclose()
     assert stopped.is_set()
     assert socket.closed
@@ -361,37 +387,36 @@ async def test_realtime_audio_producer_failure_is_propagated(mock_socket):
     assert socket.closed
 
 
-async def test_realtime_unexpected_session_end_cancels_input(mock_socket):
-    socket = Socket([{"event": "session.end"}], emit_on="audio_input")
+async def test_realtime_unexpected_close_before_input_ends_is_an_error(mock_socket):
+    socket = Socket([])
     mock_socket(socket)
+    started = asyncio.Event()
     stopped = asyncio.Event()
 
     async def microphone():
         try:
+            started.set()
             yield pcm(20)
             await asyncio.Future()
         finally:
             stopped.set()
 
+    async def close_once_sending_started():
+        await started.wait()
+        await socket.close()  # server hangs up mid-stream, before audio input finished
+
+    asyncio.create_task(close_once_sending_started())
     with pytest.raises(RuntimeError, match="before audio input finished"):
         await asyncio.wait_for(anext(vendors.transcribe_stream(microphone(), "hi-IN")), 1)
     assert stopped.is_set()
-    assert socket.closed
 
 
-async def test_realtime_end_of_input_timeout_is_reported(mock_socket, monkeypatch):
-    socket = Socket([])
-    mock_socket(socket)
-    original_sleep = asyncio.sleep
-
-    async def immediate_timeout(seconds):
-        assert seconds == 10
-        await original_sleep(0)
-
-    monkeypatch.setattr(vendors.asyncio, "sleep", immediate_timeout)
-    with pytest.raises(TimeoutError, match="did not finish"):
-        await asyncio.wait_for(anext(vendors.transcribe_stream(chunks(pcm(20)), "hi-IN")), 1)
-    assert socket.closed
+async def test_gnani_api_key_required_before_network(monkeypatch, no_network):
+    monkeypatch.setenv("VENDORS", "sarvam")
+    monkeypatch.setenv("SARVAM_API_KEY", "test-sarvam-key")
+    monkeypatch.delenv("GNANI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="GNANI_API_KEY"):
+        await anext(vendors.transcribe_stream(chunks(pcm(20)), "hi-IN"))
 
 
 @pytest.mark.parametrize("method,limit", [("translate", 1000), ("synthesize", 2500)])
@@ -401,4 +426,4 @@ async def test_vendor_text_limits_fail_before_network(method, limit, monkeypatch
         if method == "translate":
             await vendors.translate("x" * (limit + 1), "od-IN", "hi-IN")
         else:
-            await vendors.synthesize("x" * (limit + 1), "hi-IN")
+            await anext(vendors.synthesize("x" * (limit + 1), "hi-IN"))
