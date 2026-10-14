@@ -39,6 +39,13 @@ PROMPTS = {
         "failed": "କଲ୍ ସଂଯୋଗ ହୋଇପାରିଲା ନାହିଁ। ଦୟାକରି ପରେ କଲ୍ କରନ୍ତୁ।",
         "wait": "ଦୟାକରି ଅପେକ୍ଷା କରନ୍ତୁ। ଅନୁବାଦ ପାଇଁ ସମୟ ଲାଗୁଛି।",
     },
+    "bn-IN": {
+        "connected": "কল সংযুক্ত হয়েছে। আপনি শুধু অনুবাদ শুনতে পাবেন।",
+        "busy": "অন্য ফোনটি ব্যস্ত আছে। অনুগ্রহ করে পরে কল করুন।",
+        "unanswered": "অন্য ফোন থেকে কোনো উত্তর পাওয়া যায়নি। অনুগ্রহ করে পরে কল করুন।",
+        "failed": "কল সংযুক্ত করা যায়নি। অনুগ্রহ করে পরে কল করুন।",
+        "wait": "অনুগ্রহ করে অপেক্ষা করুন। অনুবাদে সময় লাগছে।",
+    },
 }
 
 
@@ -49,7 +56,7 @@ def validate_config():
     if mode == "room":
         return
     for key in ("API_KEY", "API_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
-                "LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "SARVAM_API_KEY"):
+                "LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "SARVAM_API_KEY", "GNANI_API_KEY"):
         if not os.getenv(key, "").strip():
             raise ValueError(f"{key} is required for SIP calls")
     url = urlsplit(os.getenv("LIVEKIT_URL", ""))
@@ -89,6 +96,14 @@ async def lookup(caller):
         return response.json()
 
 
+async def first_chunk(stream):
+    # Awaiting the first chunk lets VENDOR_TIMEOUT bound time-to-first-audio.
+    try:
+        return await anext(stream), stream
+    except StopAsyncIteration:
+        raise ValueError("TTS returned no audio") from None
+
+
 class Leg:
     def __init__(self, participant, language, latencies):
         self.language = language
@@ -104,6 +119,9 @@ class Leg:
         self.speech_end = None
         self.utterance_end = None
         self.closed = False
+        self.tts = vendors.TTSConnection()
+        self.transcripts = 0  # finals heard from this leg's phone
+        self.played = 0  # translated sentences played to this leg's phone
 
     async def publish(self, room):
         track = rtc.LocalAudioTrack.create_audio_track("translation", self.source)
@@ -147,6 +165,7 @@ class Leg:
             self.chunks(), self.language, on_speech_start=self.interrupt,
             on_speech_end=self.end_speech,
         ):
+            self.transcripts += 1
             await self.pending.put((text, self.speech_end))
         await self.pending.put(None)
 
@@ -161,9 +180,10 @@ class Leg:
         generation = self.generation
         try:
             async with asyncio.timeout(VENDOR_TIMEOUT):
-                pcm, rate = await vendors.synthesize(PROMPTS[self.language][kind], self.language)
+                first, stream = await first_chunk(
+                    vendors.synthesize(PROMPTS[self.language][kind], self.language, self.tts))
             async with asyncio.timeout(5):
-                await self.play(pcm, rate, None, generation)
+                await self.play(first, stream, None, generation)
         except Exception as exc:
             with suppress(Exception):
                 if not self.closed and generation == self.generation:
@@ -196,25 +216,54 @@ class Leg:
     async def speak(self, text, speaker):
         generation = self.generation
         try:
-            pcm, rate = await self.vendor_call(partial(vendors.synthesize, text, self.language), generation)
+            # A fresh stream per attempt, so vendor_call's retry restarts synthesis.
+            first, stream = await self.vendor_call(
+                lambda: first_chunk(vendors.synthesize(text, self.language, self.tts)), generation,
+            )
         except (TimeoutError, InterruptedError):
             return
-        await self.play(pcm, rate, speaker, generation)
+        try:
+            await self.play(first, stream, speaker, generation)
+        except TimeoutError:
+            # Audio already played can't be retried without repeating it; drop the rest.
+            logger.warning("vendor_sentence_truncated error=TimeoutError")
 
-    async def play(self, pcm, rate, speaker, generation):
-        if rate != self.source.sample_rate or not pcm or len(pcm) % 2:
-            raise ValueError("TTS must return nonempty mono PCM16 at 24000 Hz")
+    async def play(self, first, stream, speaker, generation):
+        rate = self.source.sample_rate
         frame_bytes = rate // 50 * 2
-        for offset in range(0, len(pcm), frame_bytes):
-            if self.closed or generation != self.generation:
-                return
-            frame = pcm[offset:offset + frame_bytes]
-            await self.source.capture_frame(rtc.AudioFrame(frame, rate, 1, len(frame) // 2))
-            if self.closed or generation != self.generation:
-                self.source.clear_queue()
-                return
-            if offset == 0 and speaker is not None and speaker.utterance_end is not None:
-                self.latencies.append((time.monotonic() - speaker.utterance_end) * 1000)
+
+        async def frames():
+            buffer = bytearray()
+            item = first
+            while item is not None:
+                pcm, chunk_rate = item
+                if chunk_rate != rate or not pcm or len(pcm) % 2:
+                    raise ValueError("TTS must return nonempty mono PCM16 at 24000 Hz")
+                buffer.extend(pcm)
+                while len(buffer) >= frame_bytes:
+                    yield bytes(buffer[:frame_bytes])
+                    del buffer[:frame_bytes]
+                async with asyncio.timeout(VENDOR_TIMEOUT):
+                    item = await anext(stream, None)
+            if buffer:
+                yield bytes(buffer)
+
+        measured = False
+        try:
+            async for frame in frames():
+                if self.closed or generation != self.generation:
+                    return
+                await self.source.capture_frame(rtc.AudioFrame(frame, rate, 1, len(frame) // 2))
+                if self.closed or generation != self.generation:
+                    self.source.clear_queue()
+                    return
+                if not measured and speaker is not None:
+                    self.played += 1
+                    if speaker.utterance_end is not None:
+                        self.latencies.append((time.monotonic() - speaker.utterance_end) * 1000)
+                measured = True
+        finally:
+            await stream.aclose()
         await self.source.wait_for_playout()
 
     async def close(self):
@@ -224,7 +273,9 @@ class Leg:
         try:
             self.interrupt()
         finally:
-            results = await asyncio.gather(self.stream.aclose(), self.source.aclose(), return_exceptions=True)
+            results = await asyncio.gather(
+                self.stream.aclose(), self.source.aclose(), self.tts.aclose(), return_exceptions=True,
+            )
             for result in results:
                 if isinstance(result, BaseException):
                     logger.error("media_cleanup_failed error=%s", type(result).__name__)
@@ -292,15 +343,26 @@ async def close_media(operation):
         logger.error("media_cleanup_failed error=%s", type(exc).__name__)
 
 
-def log_summary(call_id, latencies):
+def disconnect_reason(reason):
+    try:
+        return rtc.DisconnectReason.Name(reason)
+    except (TypeError, ValueError):
+        return reason
+
+
+def log_summary(call_id, latencies, legs=()):
     ordered = sorted(latencies)
 
     def percentile(fraction):
         return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)] if ordered else 0
 
+    # a = caller, b = receiver: "heard" counts their speech transcribed, "played" translations they got.
+    directions = "".join(
+        f" {side}_heard={leg.transcripts} {side}_played={leg.played}" for side, leg in zip("ab", legs)
+    )
     logger.info(
-        "call_summary call_id=%s utterances=%d p50_ms=%.1f p95_ms=%.1f",
-        call_id, len(ordered), percentile(0.5), percentile(0.95),
+        "call_summary call_id=%s utterances=%d p50_ms=%.1f p95_ms=%.1f%s",
+        call_id, len(ordered), percentile(0.5), percentile(0.95), directions,
     )
 
 
@@ -320,15 +382,17 @@ async def entrypoint(ctx: JobContext):
         room.on(event, callback)
         handlers.append((room, event, callback))
 
-    def disconnected(*_):
+    def disconnected(room, reason=None):
+        logger.info("room_disconnected call_id=%s room=%s reason=%s", names[0], room, disconnect_reason(reason))
         ended.set()
 
-    watch(room_a, "disconnected", disconnected)
-    watch(room_b, "disconnected", disconnected)
+    watch(room_a, "disconnected", partial(disconnected, "a"))
+    watch(room_b, "disconnected", partial(disconnected, "b"))
 
     def caller_left(participant):
         departed.add(participant.identity)
         if participant.identity == caller_identity:
+            logger.info("caller_left call_id=%s reason=%s", names[0], disconnect_reason(participant.disconnect_reason))
             ended.set()
 
     watch(room_a, "participant_disconnected", caller_left)
@@ -354,7 +418,7 @@ async def entrypoint(ctx: JobContext):
                 close_media(room_a.disconnect), close_media(room_b.disconnect),
             )
         finally:
-            log_summary(names[0], latencies)
+            log_summary(names[0], latencies, legs)
 
     async def cleanup():
         nonlocal cleanup_task
@@ -387,11 +451,22 @@ async def entrypoint(ctx: JobContext):
             .to_jwt()
         )
 
+        dialing = False
+
         def receiver_left(participant):
             if participant.identity == "receiver":
-                ended.set()
+                logger.info("receiver_left call_id=%s reason=%s", names[0], disconnect_reason(participant.disconnect_reason))
+                # While dialing, the failed leg is reported by create_sip_participant (with its SIP
+                # status) and announced to the caller; ending here would pre-empt both.
+                if not dialing:
+                    ended.set()
+
+        def receiver_status(changed, participant):
+            if participant.identity == "receiver" and "sip.callStatus" in changed:
+                logger.info("receiver_sip_status call_id=%s status=%s", names[0], changed["sip.callStatus"])
 
         watch(room_b, "participant_disconnected", receiver_left)
+        watch(room_b, "participant_attributes_changed", receiver_status)
         await asyncio.wait_for(
             room_b.connect(os.environ["LIVEKIT_URL"], token, options=rtc.RoomOptions(auto_subscribe=False)),
             PARTICIPANT_TIMEOUT,
@@ -405,11 +480,20 @@ async def entrypoint(ctx: JobContext):
             if ended.is_set():
                 return
             try:
+                dialing = True
+                logger.info("dial_started call_id=%s", names[0])
                 receiver = await dial_receiver(ctx, room_b, a, route["other_no"])
+                logger.info("dial_answered call_id=%s", names[0])
             except Exception as exc:
+                logger.warning(
+                    "dial_failed call_id=%s outcome=%s sip_status=%s error=%s", names[0],
+                    dial_failure(exc), getattr(exc, "sip_status_code", None), type(exc).__name__,
+                )
                 if not ended.is_set():
                     await a.announce(dial_failure(exc))
                 raise
+            finally:
+                dialing = False
         else:
             receiver = await asyncio.wait_for(utils.wait_for_participant(room_b, identity="receiver"), PARTICIPANT_TIMEOUT)
             a = Leg(caller, route["caller_lang"], latencies)
@@ -435,10 +519,15 @@ async def entrypoint(ctx: JobContext):
         async def conversation():
             if sip:
                 await asyncio.gather(a.announce("connected"), b.announce("connected"))
+            def translation_failed(exc):
+                if not isinstance(exc, InterruptedError):  # listener barged in; expected
+                    logger.warning("translation_failed call_id=%s error=%s", names[0], type(exc).__name__)
+
             await run_call(
                 a.finals(), b.finals(),
                 partial(a.translate_to, listener=b), partial(b.translate_to, listener=a),
                 partial(a.speak, speaker=b), partial(b.speak, speaker=a),
+                on_error=translation_failed,
             )
 
         tasks.extend([

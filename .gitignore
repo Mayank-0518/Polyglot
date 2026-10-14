@@ -1,4 +1,5 @@
 .env
+.claude
 .venv/
 .tools/
 data/
