@@ -14,7 +14,7 @@ async def run_direction(finals, translate, speak, on_error=None):
         await speak(translated)
 
 
-async def run_call(a_finals, b_finals, translate_ab, translate_ba, speak_to_a, speak_to_b):
+async def run_call(a_finals, b_finals, translate_ab, translate_ba, speak_to_a, speak_to_b, on_error=None):
     async with asyncio.TaskGroup() as tasks:
-        tasks.create_task(run_direction(a_finals, translate_ab, speak_to_b))
-        tasks.create_task(run_direction(b_finals, translate_ba, speak_to_a))
+        tasks.create_task(run_direction(a_finals, translate_ab, speak_to_b, on_error))
+        tasks.create_task(run_direction(b_finals, translate_ba, speak_to_a, on_error))

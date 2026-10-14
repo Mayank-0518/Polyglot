@@ -1,10 +1,12 @@
 import array
 import asyncio
 import base64
+import contextlib
 import json
 import math
 import os
 import sys
+import time
 import wave
 from pathlib import Path
 
@@ -81,8 +83,82 @@ _TTS_VOICES = {
 }
 
 
-async def synthesize(text, lang):
-    """Yield (pcm_chunk, rate) pairs of mono PCM16 audio at 24000 Hz, streamed as it's synthesized."""
+async def _tts_event(ws):
+    message = await ws.receive()
+    if message.type != aiohttp.WSMsgType.TEXT:
+        raise RuntimeError("Gnani TTS socket closed unexpectedly")
+    event = json.loads(message.data)
+    if not isinstance(event, dict):
+        raise ValueError("Invalid Gnani TTS event")
+    if event.get("type") == "error":
+        raise RuntimeError(f"Gnani TTS reported an error: {event.get('message')}")
+    return event
+
+
+class TTSConnection:
+    """One Gnani TTS WebSocket reused across sentences, reconnecting when it can't be trusted."""
+
+    # Observed live: Gnani drops sockets idle 20-45s without notice, and pings don't prevent it.
+    IDLE_LIMIT = 20
+
+    def __init__(self):
+        self._stack = contextlib.AsyncExitStack()
+        self._ws = None
+        self._last_used = 0.0
+        self._lock = asyncio.Lock()
+
+    async def aclose(self):
+        self._ws = None
+        stack, self._stack = self._stack, contextlib.AsyncExitStack()
+        await stack.aclose()
+
+    async def stream(self, key, request):
+        """Yield PCM chunks for one request; one request at a time per socket."""
+        async with self._lock:
+            finished = False
+            try:
+                for _ in range(2):
+                    reused = self._ws is not None and time.monotonic() - self._last_used < self.IDLE_LIMIT
+                    if not reused:
+                        await self.aclose()
+                        session = await self._stack.enter_async_context(
+                            aiohttp.ClientSession(headers={"X-API-Key-ID": key}))
+                        self._ws = await self._stack.enter_async_context(
+                            session.ws_connect("wss://api.vachana.ai/api/v1/tts"))
+                    try:
+                        await self._ws.send_json(request)
+                        event = await _tts_event(self._ws)
+                        break
+                    except (aiohttp.ClientError, RuntimeError):
+                        await self.aclose()
+                        if not reused:
+                            raise
+                while True:
+                    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                    if event.get("type") in {"audio", "complete"}:
+                        encoded = data.get("audio")
+                        if encoded:
+                            pcm = base64.b64decode(encoded, validate=True)
+                            if len(pcm) % 2:
+                                raise ValueError("Gnani returned malformed PCM16 audio")
+                            yield pcm
+                        if data.get("is_final"):
+                            finished = True
+                            self._last_used = time.monotonic()
+                            return
+                    event = await _tts_event(self._ws)
+            finally:
+                if not finished:
+                    # Chunks carry no request id, so an unfinished request's leftovers would
+                    # play at the start of the next sentence on this socket.
+                    await self.aclose()
+
+
+async def synthesize(text, lang, connection=None):
+    """Yield (pcm_chunk, rate) pairs of mono PCM16 audio at 24000 Hz, streamed as it's synthesized.
+
+    Pass a TTSConnection to reuse one socket across calls; otherwise a one-off socket is used.
+    """
     mode = _mode(lang)
     if not text.strip():
         raise ValueError("Speech text must not be blank")
@@ -110,36 +186,24 @@ async def synthesize(text, lang):
     key = os.getenv("GNANI_API_KEY", "")
     if not key.strip():
         raise ValueError("GNANI_API_KEY is required for Gnani TTS")
-    headers = {"X-API-Key-ID": key}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.ws_connect("wss://api.vachana.ai/api/v1/tts") as ws:
-            await ws.send_json({
-                "text": text, "voice": voice, "model": "timbre-v2.5", "language": lang,
-                "audio_config": {
-                    "sample_rate": rate, "num_channels": 1, "sample_width": 2,
-                    "encoding": "linear_pcm", "container": "raw",
-                },
-            })
-            while True:
-                message = await ws.receive()
-                if message.type != aiohttp.WSMsgType.TEXT:
-                    raise RuntimeError("Gnani TTS socket closed unexpectedly")
-                event = json.loads(message.data)
-                if not isinstance(event, dict):
-                    raise ValueError("Invalid Gnani TTS event")
-                kind = event.get("type")
-                if kind == "error":
-                    raise RuntimeError(f"Gnani TTS reported an error: {event.get('message')}")
-                data = event.get("data") if isinstance(event.get("data"), dict) else {}
-                if kind in {"audio", "complete"}:
-                    encoded = data.get("audio")
-                    if encoded:
-                        pcm = base64.b64decode(encoded, validate=True)
-                        if len(pcm) % 2:
-                            raise ValueError("Gnani returned malformed PCM16 audio")
-                        yield pcm, rate
-                    if data.get("is_final"):
-                        return
+    request = {
+        "text": text, "voice": voice, "model": "timbre-v2.5", "language": lang,
+        "audio_config": {
+            "sample_rate": rate, "num_channels": 1, "sample_width": 2,
+            "encoding": "linear_pcm", "container": "raw",
+        },
+    }
+    owned = connection is None
+    if owned:
+        connection = TTSConnection()
+    try:
+        # aclosing: async-for won't close the inner stream on early exit, which would hold its lock.
+        async with contextlib.aclosing(connection.stream(key, request)) as chunks:
+            async for pcm in chunks:
+                yield pcm, rate
+    finally:
+        if owned:
+            await connection.aclose()
 
 
 async def transcribe_file(path, lang):
