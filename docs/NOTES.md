@@ -2,9 +2,9 @@
 
 ## Current demo scope (updated 2026-10-11)
 
-The user has narrowed the first implementation to server-mediated translation between +919123260733 (Odia, `od-IN`) and +916392306428 (Hindi, `hi-IN`). Either phone may initiate. The server routes the configured caller to the other configured phone; unknown callers are rejected. No order IDs, rider IDs, session registrations, virtual-number leases or database are needed for this demo. The previous lease implementation is backed up under `data/p1-leases-backup.zip`.
+The user has narrowed the first implementation to server-mediated translation between +919123260733 (Bengali, `bn-IN`) and +916392306428 (Hindi, `hi-IN`). Either phone may initiate. The server routes the configured caller to the other configured phone; unknown callers are rejected. No order IDs, rider IDs, session registrations, virtual-number leases or database are needed for this demo. The previous lease implementation is backed up under `data/p1-leases-backup.zip`.
 
-Use a uv-managed Python `.venv` locally and a separate uv environment in Docker. See `SETUP.md` for commands and `PLAN.md` for the current contracts and phase status. Sarvam uses [`od-IN` for Odia](https://docs.sarvam.ai/api/getting-started/models/sarvam-translate).
+Use a uv-managed Python `.venv` locally and a separate uv environment in Docker. See `SETUP.md` for commands and `PLAN.md` for the current contracts and phase status. Party A uses `bn-IN` for Bengali throughout routing, speech recognition, translation and synthesis.
 
 Real calls still need a telephony ingress: either mobile dials the provider-owned inbound SIP number, and the server dials the other mobile. A direct ordinary call between the two mobiles bypasses this server.
 
@@ -15,7 +15,7 @@ For the current real-phone test, the US number is already procured. FastAPI and 
 ## Goal
 Translate calls live in both directions between **drivers or delivery partners and customers** on platforms like Uber, Zomato, Swiggy and Rapido. Each person hears the other in their own language, on a normal phone call, with no app install and the regular phone dialer.
 
-**Current example:** the Odia phone calls the server number, which calls the Hindi phone. Odia speech is heard as Hindi, and replies are heard as Odia. The Hindi phone can also initiate.
+**Current example:** the Bengali phone calls the server number, which calls the Hindi phone. Bengali speech is heard as Hindi, and replies are heard as Bengali. The Hindi phone can also initiate.
 
 This is a standalone project, separate from Arrowhead.
 
@@ -50,8 +50,8 @@ Both legs end at **the server**. Each person hears **only** the audio the server
 Caller ⇄ RTP ⇄ Telephony provider ⇄ LiveKit (room A) ⇄ SERVER ⇄ LiveKit (room B) ⇄ Telephony provider ⇄ RTP ⇄ Receiver
 
 Inside the server:
-  Odia phone audio → [speech-to-text (od) → translate od→hi → text-to-speech (hi)] → Hindi phone
-  Hindi phone audio → [speech-to-text (hi) → translate hi→od → text-to-speech (od)] → Odia phone
+  Bengali phone audio → [speech-to-text (bn) → translate bn→hi → text-to-speech (hi)] → Hindi phone
+  Hindi phone audio → [speech-to-text (hi) → translate hi→bn → text-to-speech (bn)] → Bengali phone
 ```
 
 - **Leg A (inbound):** either configured phone dials the provider's server number and joins LiveKit room A.
@@ -62,7 +62,7 @@ Inside the server:
 ### Call flow
 1. Either configured phone dials the provider-owned inbound SIP number.
 2. The server checks the caller against the fixed two-phone mapping and gets the other number and both languages. An unknown caller is dropped.
-3. The demo always takes the Odia ↔ Hindi translation path, with no order lookup, lease allocation or direct audio bridge.
+3. The demo always takes the Bengali ↔ Hindi translation path, with no order lookup, lease allocation or direct audio bridge.
 4. The server dials the other phone, which rings normally.
 5. A short announcement on both legs, each in its own language: "This call is translated automatically."
 6. Both pipelines run until either side hangs up.
@@ -84,7 +84,7 @@ Same rule: don't bridge the two channels, and keep the media routed through the 
 - Plivo/Exotel remain possible future domestic-provider choices; no platform integration is part of this demo.
 
 ### Translation pipeline
-**Three-step pipeline: speech-to-text → translation → text-to-speech.** Use the real-phone accuracy gate to choose vendors for the current Odia/Hindi pair.
+**Three-step pipeline: speech-to-text → translation → text-to-speech.** Use the real-phone accuracy gate to choose vendors for the current Bengali/Hindi pair.
 - Candidates: **Sarvam AI** (speech-to-text, translation and text-to-speech built for Indian languages) or **Google** behind the same vendor interface if Sarvam fails the accuracy gate.
 - Before committing, test on real **8 kHz phone recordings with street and bike noise**. For riders, accuracy on noisy audio matters more than speed.
 
@@ -109,9 +109,9 @@ This is sold B2B; the call path belongs to the platform.
 
 ## Proposed first version (demo)
 - One US Twilio voice number with ISD access from the test phones.
-- A fixed two-phone mapping: +919123260733 (`od-IN`) and +916392306428 (`hi-IN`), with no database or IDs.
+- A fixed two-phone mapping: +919123260733 (`bn-IN`) and +916392306428 (`hi-IN`), with no database or IDs.
 - Either phone can initiate; keep the two audio legs separate and send translated audio only.
-- Three-step pipeline (Sarvam first), starting with Odia ↔ Hindi.
+- Three-step pipeline (Sarvam first), starting with Bengali ↔ Hindi.
 - One Python deployment with a uv environment, routing API and LiveKit agent.
 - Test with two real phones, ideally outdoors with traffic noise.
 

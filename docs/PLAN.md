@@ -6,8 +6,10 @@ Test server-mediated voice translation between exactly two mobile phones:
 
 | Party | Mobile | Language |
 |---|---|---|
-| A | +919123260733 | Odia (`od-IN`) |
+| A | +919123260733 | Bengali (`bn-IN`) |
 | B | +916392306428 | Hindi (`hi-IN`) |
+
+**Language update (2026-10-14):** Party A now uses Bengali (`bn-IN`) in `.env` and `.env.example`. Bengali call announcements and the Gnani TTS voice `Kirra` already exist. Current examples, recording requirements and manual call checks use Bengali/Hindi. Dated Odia/Hindi measurements below preserve their original language pair and do not establish Bengali accuracy or latency.
 
 Either phone can initiate the call. The server routes A to B or B to A using the configured pair. There are no orders, rider IDs, session registrations, leases, expiry checks, virtual-number pools, or database requirements. Unknown callers are rejected so this test server cannot dial arbitrary destinations.
 
@@ -51,6 +53,7 @@ tests/
   test_sip_config.py   P6, provider authentication, India routing and dispatch templates
   test_hardening.py    P7, mocked failure prompts, deadlines, retries, lifecycle and drain
   test_e2e_livekit.py   P5, opt-in e2e marker
+  test_bengali.py       Bengali/Hindi routing, announcements, translation and TTS configuration
   fixtures/            real 8 kHz phone recordings + transcripts
 config/sip/            Twilio inbound TwiML and LiveKit trunk/dispatch JSON examples (P6)
 ```
@@ -74,7 +77,7 @@ config/sip/            Twilio inbound TwiML and LiveKit trunk/dispatch JSON exam
 - `GET /lookup?caller=...` → 200 with the routing dictionary; 404 for unknown callers; 422 if caller is missing.
 - `/lookup` requires `X-API-Key`; missing or wrong keys return 401.
 - No `/sessions` or `/calls` endpoints. The inbound SIP number belongs to telephony configuration, not the routing lookup.
-- Supported Sarvam codes: `hi-IN kn-IN ta-IN te-IN ml-IN mr-IN bn-IN gu-IN pa-IN od-IN en-IN`. This demo uses `od-IN` and `hi-IN` only.
+- Supported Sarvam codes: `hi-IN kn-IN ta-IN te-IN ml-IN mr-IN bn-IN gu-IN pa-IN od-IN en-IN`. This demo uses `bn-IN` and `hi-IN` only.
 
 ### `app/pipeline.py` (P3)
 
@@ -148,7 +151,7 @@ Implement `app/pipeline.py`.
 
 ### P4: Vendors and accuracy (HUMAN GATE for recordings)
 
-Implement Sarvam and fake vendors. The human supplies at least 10 noisy real-phone recordings per language, Odia and Hindi, at 8 kHz mono WAV with exact native-script `.txt` transcripts under `tests/fixtures/od-IN_<nn>` and `hi-IN_<nn>`.
+Implement Sarvam and fake vendors. The human supplies at least 10 noisy real-phone recordings per language, Bengali and Hindi, at 8 kHz mono WAV with exact native-script `.txt` transcripts under `tests/fixtures/bn-IN_<nn>` and `hi-IN_<nn>`.
 
 **Checkpoint:** `uv run --extra test --env-file .env pytest -m live -v` with `SARVAM_API_KEY`: translation/TTS checks pass and average word overlap across recordings is at least 0.6. Compare Google only if Sarvam falls short; the human chooses the vendor.
 
@@ -275,7 +278,7 @@ Historical SIP configuration preflight (2026-10-10): `docker compose run --rm --
 
 **Manual checkpoint:**
 
-- [ ] From +919123260733, dial the US Twilio `SIP_NUMBER` using ISD; +916392306428 rings. Odia speech is heard as Hindi and replies as Odia. No original voice crosses either leg.
+- [ ] From +919123260733, dial the US Twilio `SIP_NUMBER` using ISD; +916392306428 rings. Bengali speech is heard as Hindi and replies as Bengali. No original voice crosses either leg.
 - [ ] Repeat with +916392306428 initiating; +919123260733 rings. Languages stay attached to their configured phones.
 - [ ] The receiver sees the provider's number, not the other mobile number.
 - [ ] After 10 utterances, `call_summary` shows p50 latency below 2000 ms.
@@ -305,9 +308,9 @@ After checking `.env` was still local/room/fake and recreating the worker with `
 
 Changes are confined to `app/agent.py`, its test fixture support/two cleanup regressions in `tests/test_agent.py`, `tests/test_hardening.py`, the Compose shutdown grace period and this plan/setup documentation. P1–P4 implementation, original E2E tests, dependencies, lockfile, Dockerfile, credentials and SIP templates are unchanged. Existing images use the source bind mount; no rebuild was needed.
 
-**Human gates — PENDING:** P4 still requires **at least 10 real noisy-phone recordings per language** and transcript-based accuracy validation. P6 now requires Twilio/LiveKit provisioning, Mumbai deployment and every phone checkpoint above. Real Hindi/Odia announcement audibility, real busy/no-answer codes, deployed draining and sustained phone latency remain unverified. No scope beyond P7 was added.
+**Human gates — PENDING:** P4 still requires **at least 10 real noisy-phone recordings per language** and transcript-based accuracy validation. P6 now requires Twilio/LiveKit provisioning, Mumbai deployment and every phone checkpoint above. Real Hindi/Bengali announcement audibility, real busy/no-answer codes, deployed draining and sustained phone latency remain unverified. No scope beyond P7 was added.
 
-**Stop condition:** P6 passes with the two configured phones, Odia ↔ Hindi. Nothing beyond P7 without a new plan.
+**Stop condition:** P6 passes with the two configured phones, Bengali ↔ Hindi. Nothing beyond P7 without a new plan.
 
 ## Deferred
 

@@ -2,7 +2,7 @@
 
 Use **uv** for a project-local Python 3.12 `.venv`. Use **Docker Desktop** for the local LiveKit server and optional containerized API/agent/tests. Docker builds its own Linux uv environment at `/opt/venv`; it never uses the Windows `.venv`.
 
-`PLAN.md` describes the phases and contracts. `NOTES.md` explains the architecture. The current demo has exactly two configured phones, Odia ↔ Hindi, with either phone able to initiate. There are no order/session registrations or leases.
+`PLAN.md` describes the phases and contracts. `NOTES.md` explains the architecture. The current demo has exactly two configured phones, Bengali ↔ Hindi, with either phone able to initiate. There are no order/session registrations or leases.
 
 **Provider update (2026-10-11):** Use a US Twilio voice number with LiveKit Cloud. `.env` and `.env.example` now target `DIAL_MODE=sip` and `VENDORS=sarvam`, with missing cloud/provider values left blank. Fill them before starting services. Existing API/Sarvam secrets and the phone pair are preserved; the previous local `.env` is backed up under ignored `data/`. Application logic is unchanged. Follow section 6 for the current setup; dated local verification below is historical.
 
@@ -91,7 +91,7 @@ Windows Application Control blocked a PyAV DLL when importing `livekit.agents` d
 |---|---|---|
 | `API_KEY` | Random secret | Same strong secret shared by API and agent |
 | `PARTY_A_NO` | `+919123260733` | Same |
-| `PARTY_A_LANG` | `od-IN` (Odia) | Same |
+| `PARTY_A_LANG` | `bn-IN` (Bengali) | Same |
 | `PARTY_B_NO` | `+916392306428` | Same |
 | `PARTY_B_LANG` | `hi-IN` (Hindi) | Same |
 | `SIP_NUMBER` | Empty | Your Twilio-owned voice-capable US `+1` number |
@@ -180,16 +180,18 @@ curl.exe -s http://127.0.0.1:8000/healthz
 
 ## 5. P4 recordings
 
-The vendor implementation uses Sarvam [REST translation](https://docs.sarvam.ai/api-reference/text/translate-text), [REST TTS](https://docs.sarvam.ai/api-reference/text-to-speech/convert), [file STT](https://docs.sarvam.ai/api-reference/speech-to-text/transcribe), and [realtime STT](https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/realtime-streaming). Models are `sarvam-translate:v1` for native-script translation (application limit remains 1000 characters), `bulbul:v3` with voice `shubh` for PCM16 TTS (maximum 2500 characters), and `saaras:v4` for transcription. The translation request omits `output_script`, which this model does not support. Realtime STT uses `or-IN` for Odia; the adapter maps from `od-IN`, leaving phone configuration and REST language codes unchanged.
+The current vendor implementation uses Sarvam [REST translation](https://docs.sarvam.ai/api-reference/text/translate-text) and [file STT](https://docs.sarvam.ai/api-reference/speech-to-text/transcribe), with Gnani for live streaming STT and PCM16 TTS. Models are `sarvam-translate:v1` for native-script translation (application limit remains 1000 characters), Gnani `timbre-v2.5` for TTS (maximum 2500 characters), and `saaras:v4` for file transcription. The translation request omits `output_script`, which this model does not support. The current Bengali/Hindi pair passes `bn-IN` and `hi-IN` unchanged to the live vendors. The dated checkpoint below used the earlier Sarvam speech adapters.
 
 `VENDORS=fake` requires no Sarvam key or network. It provides deterministic STT, translation markers, and test tones. Sarvam failures raise errors; they never fall back to fake output or original speech. P7 applies translation/TTS deadlines, one retry and bounded wait prompts in the worker, without changing the vendor adapter contracts.
 
 Latest recorded live checkpoint (2026-10-10): **9 passed, 0 failed, 0 skipped**, using the configured local Sarvam key and the 20 synthetic speech fixtures. Both translation directions pass the unchanged 1.5-second limit, both TTS languages pass, file-STT word overlap averages 0.94, and streaming STT passes for Odia and Hindi. Reports and the model comparison are recorded in `PLAN.md`. This does not complete the real noisy-phone recordings human gate. Keep credentials out of chat. Live tests explicitly select Sarvam; `.env` used `VENDORS=fake` at that historical checkpoint.
 
-Record at least 10 real noisy-phone clips per language, Odia and Hindi. Save each as PCM16 8 kHz mono WAV, no longer than 30 seconds, with an exact native-script transcript in UTF-8:
+Party A now uses Bengali (`bn-IN`). Earlier Odia/Hindi checkpoint results above and in `PLAN.md` are historical; they do not validate Bengali speech or latency. Live STT sends `bn-IN` to Gnani, translation sends it to Sarvam, and Gnani TTS uses the Bengali voice `Kirra`. No Odia language-code mapping is used for this pair.
+
+Record at least 10 real noisy-phone clips per language, Bengali and Hindi. Save each as PCM16 8 kHz mono WAV, no longer than 30 seconds, with an exact native-script transcript in UTF-8:
 
 ```
-tests\fixtures\od-IN_01.wav + od-IN_01.txt
+tests\fixtures\bn-IN_01.wav + bn-IN_01.txt
 tests\fixtures\hi-IN_01.wav + hi-IN_01.txt
 ```
 
@@ -206,7 +208,7 @@ Both translation directions, both TTS languages, and recorded-audio accuracy mus
 Use phrases about gates, floors, flat numbers and landmarks. Convert recordings using ffmpeg in Docker if needed:
 
 ```powershell
-docker run --rm -v "${PWD}:/w" -w /w jrottenberg/ffmpeg -i input.m4a -ar 8000 -ac 1 tests/fixtures/od-IN_01.wav
+docker run --rm -v "${PWD}:/w" -w /w jrottenberg/ffmpeg -i input.m4a -ar 8000 -ac 1 tests/fixtures/bn-IN_01.wav
 ```
 
 ## 6. P6 real calls
@@ -267,7 +269,7 @@ Implementation verification on 2026-10-10: host and Docker focused checks passed
 
 ### Manual checkpoint and rollback
 
-From +919123260733, call the US `SIP_NUMBER` using ISD; +916392306428 must ring and see the US number. Verify inbound `sip.phoneNumber` retains the original Indian caller and that incorrect inbound credentials are rejected. Check the hold tone, Odia-to-Hindi translation and Hindi-to-Odia replies. Hang up, then repeat with +916392306428 initiating. Check both hangup directions, an unconfigured third caller, interruptions, busy/no-answer prompts and deployed worker draining. After at least 10 utterances, record `call_summary` and verify p50 below 2000 ms; also judge audible lag because the metric ends at audio publication. Complete every checkbox in `PLAN.md`; mocked SIP and local LiveKit checks do not satisfy these phone checks. No session, order, rider ID or database setup is needed. The mobile ISD plan covers only the caller's international call; Twilio inbound/SIP/outbound usage, number rental, LiveKit and Sarvam are billed separately.
+From +919123260733, call the US `SIP_NUMBER` using ISD; +916392306428 must ring and see the US number. Verify inbound `sip.phoneNumber` retains the original Indian caller and that incorrect inbound credentials are rejected. Check the hold tone, Bengali-to-Hindi translation and Hindi-to-Bengali replies. Hang up, then repeat with +916392306428 initiating. Check both hangup directions, an unconfigured third caller, interruptions, busy/no-answer prompts and deployed worker draining. After at least 10 utterances, record `call_summary` and verify p50 below 2000 ms; also judge audible lag because the metric ends at audio publication. Complete every checkbox in `PLAN.md`; mocked SIP and local LiveKit checks do not satisfy these phone checks. No session, order, rider ID or database setup is needed. The mobile ISD plan covers only the caller's international call; Twilio inbound/SIP/outbound usage, number rental, LiveKit and Sarvam are billed separately.
 
 To roll back application mode, stop the cloud agent, restore the private local configuration (`DIAL_MODE=room`, `VENDORS=fake`, local LiveKit URL and development keys), and start the local stack. Leave shared provider/cloud trunks untouched. Disable only the translator dispatch rule you created if withdrawing the demo; do not delete existing provider numbers or shared trunks.
 
@@ -298,7 +300,7 @@ The runner's `-e` flags configure only the test container; the running agent mus
 
 Verified on 2026-10-10: focused host checks passed **110 tests**; full host and Docker regressions each passed **208 tests and eight routing subtests** (18 live/E2E deselected), in **7.20 seconds** and **10.69 seconds** respectively. The unchanged nine local E2E tests passed in **73.45 seconds**, with no failures or skips. Compose validation passed. An idle local worker stopped on SIGTERM with **exit code 0**, `OOMKilled=false`, and was started again. Active-job draining, timeout and shutdown cleanup were verified through SDK/mocked tests; cloud and real-call draining remain unverified. JUnit reports are `data/p7-host-unit.xml`, `data/p7-docker-unit.xml` and `data/p7-local-e2e.xml`.
 
-P7 made no real calls, Sarvam/LiveKit Cloud requests, deployment/provisioning changes or git commands. The P4 gate requiring **at least 10 real noisy-phone recordings per language** remains **PENDING and deferred**. Twilio/LiveKit provisioning, Mumbai deployment, real Hindi/Odia announcement audibility and all P6 manual phone checks remain **PENDING**. Local fake tones and mocked SIP responses do not establish those results.
+P7 made no real calls, Sarvam/LiveKit Cloud requests, deployment/provisioning changes or git commands. The P4 gate requiring **at least 10 real noisy-phone recordings per language** remains **PENDING and deferred**. Twilio/LiveKit provisioning, Mumbai deployment, real Hindi/Bengali announcement audibility and all P6 manual phone checks remain **PENDING**. Local fake tones and mocked SIP responses do not establish those results.
 
 ## Troubleshooting
 

@@ -8,10 +8,10 @@ The project translates a phone conversation between two configured people:
 
 | Party | Phone in examples/tests | Language |
 | --- | --- | --- |
-| A | `+919123260733` | Odia (`od-IN`) |
+| A | `+919123260733` | Bengali (`bn-IN`) |
 | B | `+916392306428` | Hindi (`hi-IN`) |
 
-Either person can start a translated call by dialing the provider-owned **`SIP_NUMBER`**. The server calls the other person. Odia speech becomes Hindi audio, and Hindi replies become Odia audio.
+Either person can start a translated call by dialing the provider-owned **`SIP_NUMBER`**. The server calls the other person. Bengali speech becomes Hindi audio, and Hindi replies become Bengali audio.
 
 **The phones stay in separate LiveKit rooms**, so the application sends generated translations without forwarding the other person's original voice. Dialing the other mobile directly makes an ordinary call that bypasses this project.
 
@@ -24,7 +24,7 @@ The current demo has no frontend, mobile app, database, order IDs, session regis
 | FastAPI | Identifies the configured caller and returns the other phone and both languages. | [api.py](app/api.py), [routing.py](app/routing.py) |
 | LiveKit worker | Manages the two rooms, outgoing call, audio, interruptions, and cleanup. | [agent.py](app/agent.py) |
 | Translation pipeline | Processes sentences in order and runs both conversation directions concurrently. | [pipeline.py](app/pipeline.py) |
-| Sarvam adapters | Convert speech to text, translate text, and generate spoken audio. | [vendors.py](app/vendors.py) |
+| Vendor adapters | Gnani recognizes live speech and generates audio; Sarvam translates text and transcribes files. | [vendors.py](app/vendors.py) |
 | Twilio/LiveKit templates | Describe inbound SIP, outbound SIP, and worker dispatch configuration. | [config/sip/](config/sip/) |
 
 The selected provider setup uses **Twilio inbound Programmable Voice/TwiML** and **outbound Elastic SIP Trunking**. SIP connects phone calls to LiveKit. The worker talks to LiveKit APIs; provider credentials and routing are configured outside the application.
@@ -61,9 +61,9 @@ flowchart LR
 For example, when Party A speaks:
 
 - The worker receives A's microphone audio in room A.
-- Sarvam recognizes the speech as Odia text.
+- Gnani recognizes the speech as Bengali text.
 - The worker queues the final transcript and its speech-end timestamp.
-- Sarvam translates the text into Hindi and generates Hindi audio.
+- Sarvam translates the text into Hindi; Gnani generates Hindi audio.
 - The worker publishes that audio in room B for Party B.
 
 The reverse direction uses the same steps with the languages swapped. Each direction preserves sentence order, while both directions run concurrently. Blank and partial transcripts are not translated.
@@ -72,7 +72,7 @@ The routing API returns three fields. For the Party A example:
 
 ```json
 {
-  "caller_lang": "od-IN",
+  "caller_lang": "bn-IN",
   "other_no": "+916392306428",
   "other_lang": "hi-IN"
 }
@@ -90,12 +90,12 @@ Audio and conversation text remain in application memory during processing. **Th
 | `GET /healthz` | Returns `{"status":"ok"}` without authentication. Checks API liveness, not vendor or call readiness. |
 | `GET /lookup?caller=...` | Requires `X-API-Key`; returns the route for an exact configured-number match. |
 | API errors | 401 for missing/wrong key; 404 for unknown caller; 422 for missing caller. |
-| Speech recognition | Sarvam `saaras:v4`; live calls use streaming STT. File STT is used by accuracy tests. |
+| Speech recognition | Gnani streaming STT for live calls; Sarvam `saaras:v4` for file transcription. |
 | Translation | Sarvam `sarvam-translate:v1`; maximum 1000 characters in Sarvam mode. |
-| Speech synthesis | Sarvam `bulbul:v3`, voice `shubh`; maximum 2500 characters in Sarvam mode. |
-| Odia language code | `od-IN` in application/REST calls; realtime STT maps it to `or-IN`. |
+| Speech synthesis | Gnani `timbre-v2.5`; Bengali voice `Kirra`, Hindi voice `Nalini`; maximum 2500 characters in live mode. |
+| Party A language code | `bn-IN` throughout routing, STT, translation and TTS. |
 
-API/vendor validation accepts 11 language codes: `hi-IN`, `kn-IN`, `ta-IN`, `te-IN`, `ml-IN`, `mr-IN`, `bn-IN`, `gu-IN`, `pa-IN`, `od-IN`, and `en-IN`. Built-in announcements and demo fixtures cover **Hindi/Odia only**; other pairs do not have equivalent verified support.
+API/vendor validation accepts 11 language codes: `hi-IN`, `kn-IN`, `ta-IN`, `te-IN`, `ml-IN`, `mr-IN`, `bn-IN`, `gu-IN`, `pa-IN`, `od-IN`, and `en-IN`. Built-in announcements cover Bengali, Hindi and Odia. Party A changed to Bengali on 14 October 2026. Earlier Odia/Hindi fixture results remain historical; Bengali real-phone accuracy and latency require new validation.
 
 ### Audio, failures, and shutdown
 
