@@ -41,7 +41,10 @@ def test_bengali_announcements(kind):
     assert any("\u0980" <= char <= "\u09ff" for char in PROMPTS["bn-IN"][kind])
 
 
-@pytest.mark.parametrize("src, tgt", [("bn-IN", "hi-IN"), ("hi-IN", "bn-IN")])
+@pytest.mark.parametrize("src, tgt", [
+    ("bn-IN", "hi-IN"), ("en-IN", "hi-IN"),
+    ("hi-IN", "bn-IN"), ("hi-IN", "en-IN"),
+])
 async def test_translation_keeps_bengali_code(monkeypatch, src, tgt):
     monkeypatch.setenv("VENDORS", "sarvam")
 
@@ -49,22 +52,39 @@ async def test_translation_keeps_bengali_code(monkeypatch, src, tgt):
         assert endpoint == "translate"
         assert json["source_language_code"] == src
         assert json["target_language_code"] == tgt
+        if tgt in {"hi-IN", "bn-IN"}:
+            assert json["speaker_gender"] == "Male"
+        else:
+            assert "speaker_gender" not in json
+        if tgt == "hi-IN":
+            assert json["model"] == "mayura:v1"
+            assert json["mode"] == "code-mixed"
+        else:
+            assert json["model"] == "sarvam-translate:v1"
+            assert "mode" not in json
         return {"translated_text": "translated"}
 
     monkeypatch.setattr(vendors, "_post", post)
     assert await vendors.translate("text", src, tgt) == "translated"
 
 
-async def test_bengali_synthesis_uses_bengali_voice(monkeypatch):
+@pytest.mark.parametrize("text, lang, voice", [
+    ("নমস্কার", "bn-IN", "Dhruva"),
+    ("नमस्ते", "hi-IN", "Deepak"),
+    ("आपकी meeting कल scheduled है।", "hi-IN", "Deepak"),
+])
+async def test_synthesis_uses_language_voice(monkeypatch, text, lang, voice):
     monkeypatch.setenv("VENDORS", "sarvam")
     monkeypatch.setenv("GNANI_API_KEY", "test-key")
 
     async def stream(key, request):
         assert key == "test-key"
-        assert request["language"] == "bn-IN"
-        assert request["voice"] == "Kirra"
+        assert request["text"] == text
+        assert request["language"] == lang
+        assert request["voice"] == voice
+        assert request["model"] == "timbre-v2.5"
         yield b"\x00\x00"
 
     connection = SimpleNamespace(stream=stream)
-    chunks = [chunk async for chunk in vendors.synthesize("নমস্কার", "bn-IN", connection)]
+    chunks = [chunk async for chunk in vendors.synthesize(text, lang, connection)]
     assert chunks == [(b"\x00\x00", 24000)]

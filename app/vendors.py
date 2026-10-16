@@ -53,13 +53,18 @@ async def translate(text, src, tgt):
         return f"[{tgt}] {text}"
     if len(text) > 1000:
         raise ValueError("Translation input must not exceed 1000 characters")
-    result = await _post("translate", json={
+    request = {
         "input": text,
         "source_language_code": src,
         "target_language_code": tgt,
         # This model returns native script and does not support output_script.
         "model": "sarvam-translate:v1",
-    })
+    }
+    if tgt == "hi-IN":
+        request.update(model="mayura:v1", mode="code-mixed")
+    if tgt in {"hi-IN", "bn-IN"}:
+        request["speaker_gender"] = "Male"
+    result = await _post("translate", json=request)
     translated = result.get("translated_text")
     if not isinstance(translated, str) or not translated.strip():
         raise ValueError("Sarvam returned no translation")
@@ -77,8 +82,8 @@ def _pcm_wav(source):
 
 
 _TTS_VOICES = {
-    "en-IN": "Kaveri", "hi-IN": "Nalini", "ta-IN": "Asmita", "te-IN": "Suhana",
-    "kn-IN": "Saanvi", "ml-IN": "Reshma", "mr-IN": "Zahira", "bn-IN": "Kirra",
+    "en-IN": "Kaveri", "hi-IN": "Deepak", "ta-IN": "Asmita", "te-IN": "Suhana",
+    "kn-IN": "Saanvi", "ml-IN": "Reshma", "mr-IN": "Zahira", "bn-IN": "Dhruva",
     "gu-IN": "Falak", "pa-IN": "Mehuli",
 }
 
