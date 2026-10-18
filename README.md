@@ -1,4 +1,4 @@
-# Dragoman: real-time translated phone calls
+# Polyglot: real-time translated phone calls
 
 Two people who don't share a language talk on ordinary mobile phones. Each sentence is transcribed, translated and spoken to the other person in their own language, live, both ways at once.
 
