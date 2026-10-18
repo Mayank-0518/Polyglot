@@ -6,8 +6,8 @@ The current demo connects one fixed pair of phones:
 
 | Party | Phone | Language | Hears translations in the voice |
 |---|---|---|---|
-| A | `+919123260733` | Bengali (`bn-IN`) | Dhruva (male) |
-| B | `+916392306428` | Hindi (`hi-IN`) | Deepak (male) |
+| A | `+9191xxx` | Bengali (`bn-IN`) | Dhruva (male) |
+| B | `+9163xxx` | Hindi (`hi-IN`) | Deepak (male) |
 
 Either phone starts a call by dialling the project's Twilio number (`SIP_NUMBER`). The server then rings the other phone. Dialling the other mobile directly is just a normal, untranslated call.
 
@@ -36,35 +36,34 @@ That server in the middle is also the right place to add **translation**. Instea
 ## Architecture
 
 ```mermaid
-flowchart LR
-    A(["Phone A<br/>Bengali"])
-    NUM["Twilio number<br/>SIP_NUMBER<br/>+ TwiML Bin"]
-    IN["LiveKit<br/>inbound trunk<br/>+ dispatch rule"]
-    RA["LiveKit<br/>Room A"]
-    AG{{"agent<br/>app/agent.py"}}
-    RB["LiveKit<br/>Room B"]
-    OUT["LiveKit<br/>outbound trunk"]
-    ESIP["Twilio<br/>Elastic SIP trunk"]
-    B(["Phone B<br/>Hindi"])
+flowchart TB
+    A(["Phone A · Bengali"])
+    NUM["Twilio number · SIP_NUMBER<br/>Programmable Voice + TwiML Bin"]
+    IN["LiveKit inbound trunk<br/>+ dispatch rule"]
+    RA["LiveKit Room A<br/>caller + translator"]
+    AG{{"agent · app/agent.py"}}
+    RB["LiveKit Room B<br/>receiver + translator"]
+    OUT["LiveKit outbound trunk"]
+    ESIP["Twilio Elastic SIP trunk"]
+    B(["Phone B · Hindi"])
 
     API["api · FastAPI<br/>GET /lookup"]
     STT["Gnani STT<br/>realtime WebSocket"]
-    MT["Sarvam translate<br/>REST"]
+    MT["Translation endpoint<br/>REST"]
     TTS["Gnani TTS<br/>streaming WebSocket"]
 
-    A ---|"1 · dials<br/>SIP_NUMBER"| NUM
-    NUM ---|"2 · SIP INVITE"| IN
-    IN ---|"3 · new room,<br/>agent dispatched"| RA
-    RA ---|"leg 1 audio"| AG
-    AG ---|"leg 2 audio"| RB
-    RB ---|"5 · agent dials"| OUT
-    OUT ---|"SIP INVITE"| ESIP
-    ESIP ---|"6 · PSTN call"| B
-
+    A -->|"1 · dials SIP_NUMBER"| NUM
+    NUM -->|"2 · SIP INVITE"| IN
+    IN -->|"3 · new room, agent dispatched"| RA
+    RA <-->|"leg 1 audio"| AG
     AG -->|"4 · who is calling?"| API
     AG <-->|"speech → text"| STT
     AG <-->|"text → text"| MT
     AG <-->|"text → speech"| TTS
+    AG <-->|"leg 2 audio"| RB
+    RB ---|"5 · agent dials"| OUT
+    OUT -->|"SIP INVITE"| ESIP
+    ESIP -->|"6 · PSTN call"| B
 
     classDef phone fill:#f5f5f5,stroke:#666,color:#111
     classDef twilio fill:#fde2e4,stroke:#d33,color:#111
@@ -88,7 +87,7 @@ flowchart LR
 | **agent** | Runs the call: identifies the caller, dials the other phone, streams audio through STT → translate → TTS in both directions, handles interruptions, failures and cleanup. | `app/agent.py` |
 | **api** | A tiny authenticated phonebook: given the caller's number, returns the other phone and both languages. | `app/api.py`, `app/routing.py` |
 | **LiveKit outbound trunk** | Places the call to the other phone through Twilio's Elastic SIP trunk, showing `SIP_NUMBER` as caller ID. | `config/sip/outbound-trunk.example.json` |
-| **Vendors** | Gnani: live speech-to-text and streamed text-to-speech. Sarvam: text translation. | `app/vendors.py` |
+| **Vendors** | Gnani: live speech-to-text and streamed text-to-speech. Translation endpoint: text translation. | `app/vendors.py` |
 
 ### Inbound vs outbound trunk
 
@@ -173,13 +172,13 @@ Each direction runs independently and processes one sentence at a time:
 ```mermaid
 flowchart LR
     MIC["Speaker audio<br/>16 kHz PCM from LiveKit"] --> STT["Gnani STT<br/>1024-byte frames<br/>server-side VAD"]
-    STT -->|"final transcript"| MT["Sarvam translate<br/>to Hindi: mayura:v1, code-mixed<br/>to Bengali: sarvam-translate:v1<br/>speaker_gender = Male"]
+    STT -->|"final transcript"| MT["Translation endpoint<br/>to Hindi: code-mixed mode<br/>speaker_gender = Male"]
     MT -->|"translated text"| TTS["Gnani TTS · timbre-v2.5<br/>Hindi: Deepak · Bengali: Dhruva<br/>24 kHz audio chunks"]
     TTS -->|"streamed"| OUT["Listener's room<br/>played in 20 ms frames"]
 ```
 
 - **Speech-to-text.** One Gnani WebSocket per phone. Gnani's server-side voice detection decides where a sentence ends. It sends `speech_start` when someone starts talking and a final `transcript` when they stop. (`speech_start` isn't in Gnani's published docs but is sent by the live server.)
-- **Translation.** Sarvam REST, one request per sentence. Translation into Hindi uses `mayura:v1` in code-mixed mode, so English words people commonly use stay natural. Both targets request male-gendered phrasing to match the male voices.
+- **Translation.** A REST translation endpoint, one request per sentence. Translation into Hindi uses a code-mixed mode, so English words people commonly use stay natural. Both targets request male-gendered phrasing to match the male voices.
 - **Text-to-speech.** Gnani streams audio back in chunks, and playback starts on the first chunk instead of waiting for the whole sentence. Each phone keeps **one TTS WebSocket open for the whole call**. That cuts time-to-first-audio from about 500 ms to about 250 ms on later sentences. The socket is replaced after 20 s of idle time (Gnani silently drops idle sockets), or after an interrupted sentence (leftover audio would otherwise leak into the next one).
 - **Interruptions (barge-in).** If the listener starts talking while translated speech is playing to them, playback stops immediately and pending sentences are dropped.
 - **Slow vendors.** Translation and time-to-first-audio each get 3 s. On a first timeout the listener hears "please wait" in their language and the step is retried once; a second timeout skips that sentence. Original speech is never played as a fallback.
@@ -194,7 +193,7 @@ app/
   api.py        FastAPI: /healthz and authenticated /lookup
   routing.py    caller → (other phone, languages) for the configured pair
   pipeline.py   runs both translation directions concurrently
-  vendors.py    Gnani STT/TTS and Sarvam translation clients, plus offline "fake" vendors
+  vendors.py    Gnani STT/TTS and translation-endpoint clients, plus offline "fake" vendors
 config/sip/     templates for the LiveKit inbound/outbound trunks, dispatch rule and Twilio TwiML Bin
 tests/          unit tests (test_bengali.py) and a LiveKit end-to-end test (see Testing)
 docs/           design notes, implementation plan, project overview
@@ -211,17 +210,17 @@ Copy `.env.example` to `.env` and fill it in. Never commit `.env`.
 |---|---|
 | `API_KEY` | Shared secret between agent and API (any long random string) |
 | `API_URL` | Where the agent reaches the API (`http://api:8000` inside Docker) |
-| `PARTY_A_NO`, `PARTY_A_LANG` | First phone and its language (`+919123260733`, `bn-IN`) |
-| `PARTY_B_NO`, `PARTY_B_LANG` | Second phone and its language (`+916392306428`, `hi-IN`) |
+| `PARTY_A_NO`, `PARTY_A_LANG` | First phone and its language (`+9191xxx`, `bn-IN`) |
+| `PARTY_B_NO`, `PARTY_B_LANG` | Second phone and its language (`+9163xxx`, `hi-IN`) |
 | `SIP_NUMBER` | The Twilio number both phones dial, also the outbound caller ID |
-| `VENDORS` | `sarvam` = real vendors (Gnani + Sarvam) · `fake` = offline stand-ins |
-| `SARVAM_API_KEY` | Sarvam, for translation |
+| `VENDORS` | Real vendors (Gnani + translation endpoint) or `fake` offline stand-ins; values in `.env.example` |
+| Translation API key | Key for the translation endpoint (variable name in `.env.example`) |
 | `GNANI_API_KEY` | Gnani, for speech-to-text and text-to-speech |
 | `DIAL_MODE` | `sip` = real phone calls · `room` = simulated participants |
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | LiveKit Cloud project |
 | `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` | LiveKit outbound trunk ID (`ST_…`, not Twilio's `TK…`) |
 
-In `sip` mode the agent refuses to start unless every value is set, `LIVEKIT_URL` is a `wss://….livekit.cloud` URL, the dev keys aren't in use, and `VENDORS=sarvam`.
+In `sip` mode the agent refuses to start unless every value is set, `LIVEKIT_URL` is a `wss://….livekit.cloud` URL, the dev keys aren't in use, and real vendors are selected.
 
 One-time provisioning of the Twilio number, TwiML Bin, Elastic SIP trunk and the LiveKit trunks/dispatch rule is described in [SETUP.md §6](SETUP.md), using the templates in `config/sip/`.
 
